@@ -1,4 +1,3 @@
-
 /*
  * ============================================================================
  *  Project      : Folder Size Explorer
@@ -11,234 +10,691 @@
  *                 recursive folder sizes.
  *
  *  License      : MIT License
- *
  *  Repository   : https://github.com/harshn05/FolderSizeTool
- *
  * ============================================================================
  */
-
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
-#include <shlobj.h>
+#include <shobjidl.h>
 #include <filesystem>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <thread>
 #include <atomic>
-#include <cwctype>
 #include <sstream>
 #include <iomanip>
+#include <system_error>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "user32.lib")
 
 namespace fs = std::filesystem;
 
 struct Item {
-    std::wstring name, path;
+    std::wstring name;
+    std::wstring path;
     unsigned long long bytes = 0;
     unsigned long long files = 0;
     unsigned long long errors = 0;
 };
 
-static HWND gMainWindow, gList, gStatus, gChoose, gScan, gExport, gOpen;
+static HWND gMainWindow = nullptr;
+static HWND gList = nullptr;
+static HWND gStatus = nullptr;
+static HWND gChoose = nullptr;
+static HWND gScan = nullptr;
+static HWND gCancel = nullptr;
+static HWND gExport = nullptr;
+static HWND gOpen = nullptr;
+
 static std::wstring gRoot;
 static std::vector<Item> gItems;
+static std::thread gWorker;
 static std::atomic<bool> gBusy{false};
+static std::atomic<bool> gCancelRequested{false};
+
 static int gSortColumn = 1;
 static bool gSortAscending = false;
+
 static constexpr UINT WM_SCAN_DONE = WM_APP + 1;
 static constexpr UINT WM_SCAN_PROGRESS = WM_APP + 2;
 
-std::wstring FormatSize(unsigned long long n) {
+static std::wstring FormatSize(unsigned long long n) {
     const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
-    double v = static_cast<double>(n);
-    int u = 0;
-    while (v >= 1024.0 && u < 4) { v /= 1024.0; ++u; }
-    std::wostringstream s;
-    s << std::fixed << std::setprecision(u == 0 ? 0 : 2) << v << L" " << units[u];
-    return s.str();
-}
-std::wstring Commas(unsigned long long n) {
-    std::wstring s = std::to_wstring(n);
-    for (int i = static_cast<int>(s.size()) - 3; i > 0; i -= 3) s.insert(i, 1, L',');
-    return s;
-}
-void SetStatus(const std::wstring& s) { SetWindowTextW(gStatus, s.c_str()); }
+    double value = static_cast<double>(n);
+    int unit = 0;
 
-unsigned long long DirectorySize(const fs::path& p, unsigned long long& files, unsigned long long& errors) {
+    while (value >= 1024.0 && unit < 4) {
+        value /= 1024.0;
+        ++unit;
+    }
+
+    std::wostringstream stream;
+    stream << std::fixed << std::setprecision(unit == 0 ? 0 : 2)
+           << value << L" " << units[unit];
+    return stream.str();
+}
+
+static std::wstring Commas(unsigned long long n) {
+    std::wstring value = std::to_wstring(n);
+    for (int i = static_cast<int>(value.size()) - 3; i > 0; i -= 3)
+        value.insert(static_cast<size_t>(i), 1, L',');
+    return value;
+}
+
+static void SetStatus(const std::wstring& value) {
+    if (gStatus)
+        SetWindowTextW(gStatus, value.c_str());
+}
+
+/*
+ * Convert a normal absolute DOS path to the extended-length form understood
+ * by Windows file APIs. Already-extended paths and UNC paths are preserved.
+ */
+static std::wstring ToExtendedPath(const std::wstring& path) {
+    if (path.rfind(LR"(\\?\)", 0) == 0)
+        return path;
+
+    if (path.rfind(LR"(\\)", 0) == 0)
+        return LR"(\\?\UNC\)" + path.substr(2);
+
+    if (path.size() >= 3 && path[1] == L':' &&
+        (path[2] == L'\\' || path[2] == L'/'))
+        return LR"(\\?\)" + path;
+
+    return path;
+}
+
+static unsigned long long DirectorySize(
+    const fs::path& directory,
+    unsigned long long& files,
+    unsigned long long& errors)
+{
     unsigned long long total = 0;
     std::error_code ec;
-    fs::recursive_directory_iterator it(p, fs::directory_options::skip_permission_denied, ec), end;
-    if (ec) ++errors;
-    for (; it != end; it.increment(ec)) {
-        if (ec) { ++errors; ec.clear(); continue; }
-        std::error_code e2;
-        if (it->is_symlink(e2)) { if (it->is_directory(e2)) it.disable_recursion_pending(); continue; }
-        if (it->is_regular_file(e2)) {
-            auto n = it->file_size(e2);
-            if (!e2) { total += n; ++files; } else ++errors;
+
+    fs::recursive_directory_iterator it(
+        directory, fs::directory_options::skip_permission_denied, ec);
+    const fs::recursive_directory_iterator end;
+
+    if (ec) {
+        ++errors;
+        ec.clear();
+    }
+
+    while (it != end && !gCancelRequested.load()) {
+        std::error_code statusError;
+
+        const bool isSymlink = it->is_symlink(statusError);
+        if (statusError) {
+            ++errors;
+        } else if (isSymlink) {
+            std::error_code dirError;
+            if (it->is_directory(dirError) && !dirError)
+                it.disable_recursion_pending();
+            if (dirError)
+                ++errors;
+        } else {
+            std::error_code fileError;
+            if (it->is_regular_file(fileError)) {
+                std::error_code sizeError;
+                const auto size = it->file_size(sizeError);
+                if (!sizeError) {
+                    total += size;
+                    ++files;
+                } else {
+                    ++errors;
+                }
+            } else if (fileError) {
+                ++errors;
+            }
+        }
+
+        it.increment(ec);
+        if (ec) {
+            ++errors;
+            ec.clear();
         }
     }
+
     return total;
 }
 
-void AddRow(const Item& x) {
-    int i = ListView_GetItemCount(gList);
-    LVITEMW li{}; li.mask = LVIF_TEXT; li.iItem = i;
-    li.pszText = const_cast<wchar_t*>(x.name.c_str());
-    ListView_InsertItem(gList, &li);
-    std::wstring size = FormatSize(x.bytes), raw = Commas(x.bytes), files = Commas(x.files);
-    ListView_SetItemText(gList, i, 1, size.data());
-    ListView_SetItemText(gList, i, 2, raw.data());
-    ListView_SetItemText(gList, i, 3, files.data());
-    std::wstring err = x.errors ? Commas(x.errors) : L"";
-    ListView_SetItemText(gList, i, 4, err.data());
+static void AddRow(const Item& item) {
+    const int row = ListView_GetItemCount(gList);
+
+    LVITEMW listItem{};
+    listItem.mask = LVIF_TEXT;
+    listItem.iItem = row;
+    listItem.pszText = const_cast<wchar_t*>(item.name.c_str());
+    ListView_InsertItem(gList, &listItem);
+
+    std::wstring size = FormatSize(item.bytes);
+    std::wstring raw = Commas(item.bytes);
+    std::wstring files = Commas(item.files);
+    std::wstring errors = item.errors ? Commas(item.errors) : L"";
+
+    ListView_SetItemText(gList, row, 1, size.data());
+    ListView_SetItemText(gList, row, 2, raw.data());
+    ListView_SetItemText(gList, row, 3, files.data());
+    ListView_SetItemText(gList, row, 4, errors.data());
 }
-void RefreshRows() {
+
+static void RefreshRows() {
     ListView_DeleteAllItems(gList);
-    for (const auto& x : gItems) AddRow(x);
+    for (const auto& item : gItems)
+        AddRow(item);
 }
-void SortItems(int col) {
-    if (gSortColumn == col) gSortAscending = !gSortAscending;
-    else { gSortColumn = col; gSortAscending = col == 0; }
-    std::sort(gItems.begin(), gItems.end(), [&](const Item& a, const Item& b) {
-        int c = 0;
-        if (col == 0) c = _wcsicmp(a.name.c_str(), b.name.c_str());
-        else if (col == 1 || col == 2) c = a.bytes < b.bytes ? -1 : a.bytes > b.bytes ? 1 : 0;
-        else if (col == 3) c = a.files < b.files ? -1 : a.files > b.files ? 1 : 0;
-        else c = a.errors < b.errors ? -1 : a.errors > b.errors ? 1 : 0;
-        return gSortAscending ? c < 0 : c > 0;
-    });
+
+static void SortItems(int column) {
+    if (gSortColumn == column)
+        gSortAscending = !gSortAscending;
+    else {
+        gSortColumn = column;
+        gSortAscending = (column == 0);
+    }
+
+    std::sort(gItems.begin(), gItems.end(),
+        [&](const Item& a, const Item& b) {
+            int comparison = 0;
+
+            if (column == 0) {
+                comparison = _wcsicmp(a.name.c_str(), b.name.c_str());
+            } else if (column == 1 || column == 2) {
+                comparison = a.bytes < b.bytes ? -1 : a.bytes > b.bytes ? 1 : 0;
+            } else if (column == 3) {
+                comparison = a.files < b.files ? -1 : a.files > b.files ? 1 : 0;
+            } else {
+                comparison = a.errors < b.errors ? -1 : a.errors > b.errors ? 1 : 0;
+            }
+
+            return gSortAscending ? comparison < 0 : comparison > 0;
+        });
+
     RefreshRows();
 }
-void StartScan() {
-    if (gBusy || gRoot.empty()) return;
-    gBusy = true;
-    EnableWindow(gChoose, FALSE); EnableWindow(gScan, FALSE); EnableWindow(gExport, FALSE);
-    ListView_DeleteAllItems(gList);
-    SetStatus(L"Scanning folders... Large directories may take a while.");
-    std::wstring root = gRoot;
-    std::thread([root]() {
-        std::vector<Item> result;
-        std::error_code ec;
-        fs::directory_iterator it(fs::path(root), fs::directory_options::skip_permission_denied, ec), end;
-        for (; it != end; it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            std::error_code e;
-            if (!it->is_directory(e) || it->is_symlink(e)) continue;
-            Item x;
-            x.name = it->path().filename().wstring();
-            x.path = it->path().wstring();
-            x.bytes = DirectorySize(it->path(), x.files, x.errors);
-            result.push_back(std::move(x));
-            PostMessageW(gMainWindow, WM_SCAN_PROGRESS, static_cast<WPARAM>(result.size()), 0);
+
+/* Modern folder picker. IShellItem returns a dynamically sized filesystem path. */
+static std::wstring PickFolder(HWND owner) {
+    IFileOpenDialog* dialog = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&dialog));
+
+    if (FAILED(hr) || !dialog)
+        return {};
+
+    DWORD options = 0;
+    hr = dialog->GetOptions(&options);
+    if (SUCCEEDED(hr))
+        hr = dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+
+    if (SUCCEEDED(hr))
+        hr = dialog->Show(owner);
+
+    std::wstring selectedPath;
+
+    if (SUCCEEDED(hr)) {
+        IShellItem* item = nullptr;
+        hr = dialog->GetResult(&item);
+
+        if (SUCCEEDED(hr) && item) {
+            PWSTR path = nullptr;
+            hr = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
+
+            if (SUCCEEDED(hr) && path) {
+                selectedPath = path;
+                CoTaskMemFree(path);
+            }
+            item->Release();
         }
-        auto* out = new std::vector<Item>(std::move(result));
-        PostMessageW(gMainWindow, WM_SCAN_DONE, 0, reinterpret_cast<LPARAM>(out));
-    }).detach();
-}
-std::wstring PickFolder(HWND owner) {
-    BROWSEINFOW bi{}; bi.hwndOwner = owner; bi.lpszTitle = L"Choose a root folder";
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    PIDLIST_ABSOLUTE pid = SHBrowseForFolderW(&bi);
-    if (!pid) return {};
-    wchar_t path[MAX_PATH]{};
-    bool ok = SHGetPathFromIDListW(pid, path) != FALSE;
-    CoTaskMemFree(pid);
-    return ok ? path : L"";
-}
-void ExportCsv(HWND owner) {
-    if (gItems.empty()) return;
-    wchar_t file[MAX_PATH] = L"folder-sizes.csv";
-    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = owner;
-    ofn.lpstrFilter = L"CSV files (*.csv)\0*.csv\0All files (*.*)\0*.*\0";
-    ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    ofn.lpstrDefExt = L"csv";
-    if (!GetSaveFileNameW(&ofn)) return;
-    HANDLE h = CreateFileW(file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) { MessageBoxW(owner, L"Could not create the CSV file.", L"Export failed", MB_ICONERROR); return; }
-    std::wstring data = L"Folder,Size (bytes),Size (human),Files,Errors\r\n";
-    for (const auto& x : gItems) {
-        std::wstring name = L"\"" + x.name + L"\"";
-        size_t pos = 0; while ((pos = name.find(L"\"", pos + 1)) != std::wstring::npos) { name.insert(pos, 1, L'"'); ++pos; }
-        data += name + L"," + std::to_wstring(x.bytes) + L",\"" + FormatSize(x.bytes) + L"\"," + std::to_wstring(x.files) + L"," + std::to_wstring(x.errors) + L"\r\n";
     }
-    int bytes = WideCharToMultiByte(CP_UTF8, 0, data.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string utf8(bytes > 0 ? bytes : 0, '\0');
-    if (bytes > 0) { WideCharToMultiByte(CP_UTF8, 0, data.c_str(), -1, utf8.data(), bytes, nullptr, nullptr); utf8.pop_back(); }
-    DWORD written = 0; WriteFile(h, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr); CloseHandle(h);
+
+    dialog->Release();
+    return selectedPath;
+}
+
+static void SetScanningControls(bool scanning) {
+    EnableWindow(gChoose, !scanning);
+    EnableWindow(gScan, !scanning);
+    EnableWindow(gCancel, scanning);
+    EnableWindow(gExport, !scanning && !gItems.empty());
+}
+
+static void StartScan() {
+    if (gBusy.load() || gRoot.empty())
+        return;
+
+    if (gWorker.joinable())
+        gWorker.join();
+
+    gBusy = true;
+    gCancelRequested = false;
+    gItems.clear();
+    ListView_DeleteAllItems(gList);
+    SetScanningControls(true);
+    SetStatus(L"Scanning folders...");
+
+    const std::wstring root = ToExtendedPath(gRoot);
+
+    gWorker = std::thread([root]() {
+        std::vector<Item> results;
+        unsigned long long rootErrors = 0;
+        std::error_code ec;
+
+        fs::directory_iterator it(
+            fs::path(root), fs::directory_options::skip_permission_denied, ec);
+        const fs::directory_iterator end;
+
+        if (ec) {
+            ++rootErrors;
+            ec.clear();
+        }
+
+        while (it != end && !gCancelRequested.load()) {
+            std::error_code entryError;
+
+            const bool isSymlink = it->is_symlink(entryError);
+            if (entryError) {
+                ++rootErrors;
+            } else if (!isSymlink && it->is_directory(entryError)) {
+                if (entryError) {
+                    ++rootErrors;
+                } else {
+                    Item item;
+                    item.name = it->path().filename().wstring();
+                    item.path = it->path().wstring();
+                    item.bytes = DirectorySize(it->path(), item.files, item.errors);
+                    results.push_back(std::move(item));
+
+                    PostMessageW(gMainWindow, WM_SCAN_PROGRESS,
+                        static_cast<WPARAM>(results.size()), 0);
+                }
+            } else if (entryError) {
+                ++rootErrors;
+            }
+
+            it.increment(ec);
+            if (ec) {
+                ++rootErrors;
+                ec.clear();
+            }
+        }
+
+        auto* result = new std::vector<Item>(std::move(results));
+        PostMessageW(gMainWindow, WM_SCAN_DONE,
+            static_cast<WPARAM>(rootErrors),
+            reinterpret_cast<LPARAM>(result));
+    });
+}
+
+static std::wstring CsvEscape(const std::wstring& value) {
+    std::wstring escaped = L"\"";
+    for (wchar_t ch : value) {
+        if (ch == L'"')
+            escaped += L"\"\"";
+        else
+            escaped += ch;
+    }
+    escaped += L'"';
+    return escaped;
+}
+
+static bool WriteAll(HANDLE file, const char* data, size_t length) {
+    while (length > 0) {
+        const DWORD chunk = static_cast<DWORD>(
+            (length > 1024 * 1024) ? 1024 * 1024 : length);
+        DWORD written = 0;
+
+        if (!WriteFile(file, data, chunk, &written, nullptr) ||
+            written == 0)
+            return false;
+
+        data += written;
+        length -= written;
+    }
+    return true;
+}
+
+static void ExportCsv(HWND owner) {
+    if (gItems.empty())
+        return;
+
+    wchar_t file[MAX_PATH] = L"folder-sizes.csv";
+
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter =
+        L"CSV files (*.csv)\0*.csv\0All files (*.*)\0*.*\0";
+    dialog.lpstrFile = file;
+    dialog.nMaxFile = MAX_PATH;
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    dialog.lpstrDefExt = L"csv";
+
+    if (!GetSaveFileNameW(&dialog))
+        return;
+
+    std::wstring wideData =
+        L"Folder,Size (bytes),Size (human),Files,Errors\r\n";
+
+    for (const auto& item : gItems) {
+        wideData += CsvEscape(item.name) + L"," +
+            std::to_wstring(item.bytes) + L"," +
+            CsvEscape(FormatSize(item.bytes)) + L"," +
+            std::to_wstring(item.files) + L"," +
+            std::to_wstring(item.errors) + L"\r\n";
+    }
+
+    const int requiredBytes = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, wideData.data(),
+        static_cast<int>(wideData.size()), nullptr, 0, nullptr, nullptr);
+
+    if (requiredBytes <= 0) {
+        MessageBoxW(owner, L"Could not convert the report to UTF-8.",
+            L"Export failed", MB_ICONERROR);
+        return;
+    }
+
+    std::string utf8(static_cast<size_t>(requiredBytes), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, wideData.data(),
+            static_cast<int>(wideData.size()), utf8.data(),
+            requiredBytes, nullptr, nullptr) != requiredBytes) {
+        MessageBoxW(owner, L"Could not convert the report to UTF-8.",
+            L"Export failed", MB_ICONERROR);
+        return;
+    }
+
+    HANDLE output = CreateFileW(
+        file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (output == INVALID_HANDLE_VALUE) {
+        MessageBoxW(owner, L"Could not create the CSV file.",
+            L"Export failed", MB_ICONERROR);
+        return;
+    }
+
+    // UTF-8 BOM helps Excel recognize Unicode CSV files.
+    static const char bom[] = "\xEF\xBB\xBF";
+    const bool success =
+        WriteAll(output, bom, sizeof(bom) - 1) &&
+        WriteAll(output, utf8.data(), utf8.size());
+
+    const bool closeSuccess = CloseHandle(output) != FALSE;
+
+    if (!success || !closeSuccess) {
+        MessageBoxW(owner,
+            L"An error occurred while writing the CSV file. "
+            L"Check available disk space and permissions.",
+            L"Export failed", MB_ICONERROR);
+        return;
+    }
+
     SetStatus(L"Exported: " + std::wstring(file));
 }
-void OpenSelected() {
-    int i = ListView_GetNextItem(gList, -1, LVNI_SELECTED);
-    if (i < 0 || i >= static_cast<int>(gItems.size())) return;
-    ShellExecuteW(nullptr, L"open", gItems[i].path.c_str(), nullptr, nullptr, SW_SHOW);
+
+static void OpenSelected() {
+    const int row = ListView_GetNextItem(gList, -1, LVNI_SELECTED);
+    if (row < 0 || row >= static_cast<int>(gItems.size()))
+        return;
+
+    // ShellExecute is given the original path, not the extended filesystem path.
+    std::wstring path = gItems[static_cast<size_t>(row)].path;
+    if (path.rfind(LR"(\\?\UNC\)", 0) == 0)
+        path = LR"(\\)" + path.substr(8);
+    else if (path.rfind(LR"(\\?\)", 0) == 0)
+        path = path.substr(4);
+
+    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOW);
 }
-LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    switch (m) {
+
+static void CancelScanAndJoin() {
+    if (!gWorker.joinable())
+        return;
+
+    gCancelRequested = true;
+    gWorker.join();
+    gBusy = false;
+}
+
+static LRESULT CALLBACK WndProc(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message) {
     case WM_CREATE: {
-        gChoose = CreateWindowW(L"BUTTON", L"Choose root folder...", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 12, 12, 160, 30, h, (HMENU)101, nullptr, nullptr);
-        gScan = CreateWindowW(L"BUTTON", L"Scan", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 180, 12, 80, 30, h, (HMENU)102, nullptr, nullptr);
-        gExport = CreateWindowW(L"BUTTON", L"Export CSV", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 268, 12, 100, 30, h, (HMENU)103, nullptr, nullptr);
-        gOpen = CreateWindowW(L"BUTTON", L"Open selected", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 376, 12, 115, 30, h, (HMENU)104, nullptr, nullptr);
-        gStatus = CreateWindowW(L"STATIC", L"Choose a root folder, then click Scan.", WS_CHILD|WS_VISIBLE, 12, 50, 850, 22, h, nullptr, nullptr, nullptr);
-        gList = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS, 12, 78, 850, 480, h, (HMENU)105, GetModuleHandleW(nullptr), nullptr);
-        ListView_SetExtendedListViewStyle(gList, LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES|LVS_EX_DOUBLEBUFFER);
-        const wchar_t* heads[] = {L"Folder", L"Size", L"Bytes", L"Files", L"Errors"};
-        int widths[] = {360, 120, 150, 100, 90};
-        for (int i=0;i<5;++i) { LVCOLUMNW c{}; c.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_SUBITEM; c.pszText=const_cast<wchar_t*>(heads[i]); c.cx=widths[i]; c.iSubItem=i; ListView_InsertColumn(gList,i,&c); }
+        gChoose = CreateWindowW(L"BUTTON", L"Choose root folder...",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            12, 12, 160, 30, window, (HMENU)101, nullptr, nullptr);
+
+        gScan = CreateWindowW(L"BUTTON", L"Scan",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            180, 12, 80, 30, window, (HMENU)102, nullptr, nullptr);
+
+        gCancel = CreateWindowW(L"BUTTON", L"Cancel",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            268, 12, 80, 30, window, (HMENU)105, nullptr, nullptr);
+        EnableWindow(gCancel, FALSE);
+
+        gExport = CreateWindowW(L"BUTTON", L"Export CSV",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            356, 12, 100, 30, window, (HMENU)103, nullptr, nullptr);
+
+        gOpen = CreateWindowW(L"BUTTON", L"Open selected",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            464, 12, 115, 30, window, (HMENU)104, nullptr, nullptr);
+
+        gStatus = CreateWindowW(L"STATIC",
+            L"Choose a root folder, then click Scan.",
+            WS_CHILD | WS_VISIBLE,
+            12, 50, 850, 22, window, nullptr, nullptr, nullptr);
+
+        gList = CreateWindowW(WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL |
+            LVS_SHOWSELALWAYS,
+            12, 78, 850, 480, window, (HMENU)106,
+            GetModuleHandleW(nullptr), nullptr);
+
+        ListView_SetExtendedListViewStyle(
+            gList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES |
+            LVS_EX_DOUBLEBUFFER);
+
+        const wchar_t* headers[] = {
+            L"Folder", L"Size", L"Bytes", L"Files", L"Errors"
+        };
+        const int widths[] = {360, 120, 150, 100, 90};
+
+        for (int i = 0; i < 5; ++i) {
+            LVCOLUMNW column{};
+            column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+            column.pszText = const_cast<wchar_t*>(headers[i]);
+            column.cx = widths[i];
+            column.iSubItem = i;
+            ListView_InsertColumn(gList, i, &column);
+        }
         return 0;
     }
+
     case WM_SIZE: {
-        int width = LOWORD(l), height = HIWORD(l);
-        MoveWindow(gStatus, 12, 50, width-24, 22, TRUE);
-        MoveWindow(gList, 12, 78, width-24, height-90, TRUE);
-        for (int i=0;i<5;++i) { int wds[]={width-520,120,150,100,90}; ListView_SetColumnWidth(gList,i,wds[i]); }
+        const int width = LOWORD(lParam);
+        const int height = HIWORD(lParam);
+
+        MoveWindow(gStatus, 12, 50, width - 24, 22, TRUE);
+        MoveWindow(gList, 12, 78, width - 24, height - 90, TRUE);
+
+        const int widths[] = {width - 520, 120, 150, 100, 90};
+        for (int i = 0; i < 5; ++i)
+            ListView_SetColumnWidth(gList, i, widths[i]);
         return 0;
     }
+
     case WM_COMMAND:
-        switch (LOWORD(w)) {
-        case 101: { auto p=PickFolder(h); if(!p.empty()){gRoot=p; SetStatus(L"Root: "+gRoot); gItems.clear(); ListView_DeleteAllItems(gList);} return 0; }
-        case 102: StartScan(); return 0;
-        case 103: ExportCsv(h); return 0;
-        case 104: OpenSelected(); return 0;
+        switch (LOWORD(wParam)) {
+        case 101: {
+            const std::wstring selected = PickFolder(window);
+            if (!selected.empty()) {
+                gRoot = selected;
+                gItems.clear();
+                ListView_DeleteAllItems(gList);
+                SetStatus(L"Root: " + gRoot);
+                EnableWindow(gExport, FALSE);
+            }
+            return 0;
+        }
+        case 102:
+            StartScan();
+            return 0;
+        case 103:
+            ExportCsv(window);
+            return 0;
+        case 104:
+            OpenSelected();
+            return 0;
+        case 105:
+            if (gBusy.load()) {
+                SetStatus(L"Cancelling scan...");
+                gCancelRequested = true;
+                EnableWindow(gCancel, FALSE);
+            }
+            return 0;
         }
         break;
+
     case WM_NOTIFY: {
-        auto* nm=reinterpret_cast<NMHDR*>(l);
-        if(nm->hwndFrom==gList && nm->code==LVN_COLUMNCLICK){ auto* n=reinterpret_cast<NMLISTVIEW*>(l); SortItems(n->iSubItem); }
-        if(nm->hwndFrom==gList && nm->code==NM_DBLCLK) OpenSelected();
+        const auto* notification = reinterpret_cast<NMHDR*>(lParam);
+        if (notification->hwndFrom == gList &&
+            notification->code == LVN_COLUMNCLICK) {
+            const auto* column =
+                reinterpret_cast<NMLISTVIEW*>(lParam);
+            SortItems(column->iSubItem);
+        }
+        if (notification->hwndFrom == gList &&
+            notification->code == NM_DBLCLK)
+            OpenSelected();
         break;
     }
-    case WM_SCAN_PROGRESS: SetStatus(L"Scanning... " + std::to_wstring(w) + L" folders completed."); return 0;
+
+    case WM_SCAN_PROGRESS:
+        SetStatus(L"Scanning... " + std::to_wstring(wParam) +
+            L" folders completed.");
+        return 0;
+
     case WM_SCAN_DONE: {
-        auto* p=reinterpret_cast<std::vector<Item>*>(l);
-        if(p){gItems=std::move(*p);delete p;}
-        std::sort(gItems.begin(),gItems.end(),[](const Item&a,const Item&b){return a.bytes>b.bytes;});
-        RefreshRows(); gBusy=false;
-        EnableWindow(gChoose,TRUE); EnableWindow(gScan,TRUE); EnableWindow(gExport,TRUE);
-        unsigned long long total=0; for(auto&x:gItems) total+=x.bytes;
-        SetStatus(L"Done. " + std::to_wstring(gItems.size()) + L" folders | Total: " + FormatSize(total) + L" | Double-click a row to open it.");
+        auto* results =
+            reinterpret_cast<std::vector<Item>*>(lParam);
+
+        if (results) {
+            gItems = std::move(*results);
+            delete results;
+        }
+
+        if (gWorker.joinable())
+            gWorker.join();
+
+        gBusy = false;
+
+        std::sort(gItems.begin(), gItems.end(),
+            [](const Item& a, const Item& b) {
+                return a.bytes > b.bytes;
+            });
+
+        RefreshRows();
+        SetScanningControls(false);
+
+        unsigned long long total = 0;
+        for (const auto& item : gItems)
+            total += item.bytes;
+
+        const auto rootErrors = static_cast<unsigned long long>(wParam);
+        std::wstring status =
+            (gCancelRequested.load() ? L"Cancelled. " : L"Done. ") +
+            std::to_wstring(gItems.size()) + L" folders | Total: " +
+            FormatSize(total);
+
+        if (rootErrors)
+            status += L" | Root scan errors: " + std::to_wstring(rootErrors);
+
+        status += L" | Double-click a row to open it.";
+        SetStatus(status);
         return 0;
     }
-    case WM_DESTROY: PostQuitMessage(0); return 0;
+
+    case WM_CLOSE:
+        if (gBusy.load()) {
+            SetStatus(L"Stopping scan before exit...");
+            CancelScanAndJoin();
+        }
+        DestroyWindow(window);
+        return 0;
+
+    case WM_DESTROY:
+        // Defensive join: never leave a worker referencing a destroyed window.
+        CancelScanAndJoin();
+        PostQuitMessage(0);
+        return 0;
     }
-    return DefWindowProcW(h,m,w,l);
+
+    return DefWindowProcW(window, message, wParam, lParam);
 }
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
-    INITCOMMONCONTROLSEX ic{sizeof(ic), ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&ic);
-    WNDCLASSW wc{}; wc.lpfnWndProc=WndProc; wc.hInstance=inst; wc.lpszClassName=L"FolderSizeToolWindow";
-    wc.hCursor=LoadCursor(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
-    RegisterClassW(&wc);
-    HWND h=CreateWindowW(wc.lpszClassName,L"Folder Size Explorer",WS_OVERLAPPEDWINDOW|WS_VISIBLE,
-        CW_USEDEFAULT,CW_USEDEFAULT,900,620,nullptr,nullptr,inst,nullptr);
-    gMainWindow=h; ShowWindow(h,show); UpdateWindow(h);
-    MSG msg; while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
-    return static_cast<int>(msg.wParam);
+
+int WINAPI wWinMain(
+    HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
+{
+    const HRESULT comResult = CoInitializeEx(
+        nullptr, COINIT_APARTMENTTHREADED);
+
+    INITCOMMONCONTROLSEX controls{
+        sizeof(controls), ICC_LISTVIEW_CLASSES
+    };
+    InitCommonControlsEx(&controls);
+
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = WndProc;
+    windowClass.hInstance = instance;
+    windowClass.lpszClassName = L"FolderSizeToolWindow";
+    windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    windowClass.hbrBackground =
+        reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+
+    if (!RegisterClassW(&windowClass)) {
+        if (SUCCEEDED(comResult))
+            CoUninitialize();
+        return 1;
+    }
+
+    gMainWindow = CreateWindowW(
+        windowClass.lpszClassName,
+        L"Folder Size Explorer",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 900, 620,
+        nullptr, nullptr, instance, nullptr);
+
+    if (!gMainWindow) {
+        if (SUCCEEDED(comResult))
+            CoUninitialize();
+        return 1;
+    }
+
+    ShowWindow(gMainWindow, showCommand);
+    UpdateWindow(gMainWindow);
+
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+
+    if (SUCCEEDED(comResult))
+        CoUninitialize();
+
+    return static_cast<int>(message.wParam);
 }
