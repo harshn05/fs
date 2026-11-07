@@ -1,0 +1,85 @@
+
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ---------------------------------------------------------
+  # MSVC Build
+  # ---------------------------------------------------------
+
+  msvc:
+    name: MSVC x64 Build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Build with MSVC
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE FolderSizeTool.cpp /link /SUBSYSTEM:WINDOWS comctl32.lib shell32.lib ole32.lib comdlg32.lib user32.lib /OUT:FolderSizeTool.exe
+
+      - name: Upload MSVC executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: FolderSizeTool-MSVC-x64
+          path: FolderSizeTool.exe
+          if-no-files-found: error
+          retention-days: 7
+
+
+  # ---------------------------------------------------------
+  # MinGW-w64 Build
+  # ---------------------------------------------------------
+
+  mingw:
+    name: MinGW-w64 UCRT64 Build
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Show compiler version
+        run: |
+          g++ --version
+
+      - name: Build with MinGW-w64
+        run: |
+          g++ -std=c++17 -O2 -municode -mwindows \
+            -static -static-libgcc -static-libstdc++ \
+            FolderSizeTool.cpp -o FolderSizeTool.exe \
+            -lcomctl32 -lshell32 -lole32 -lcomdlg32 -luser32 -luuid
+
+      - name: Upload MinGW executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: FolderSizeTool-MinGW-UCRT64
+          path: FolderSizeTool.exe
+          if-no-files-found: error
+          retention-days: 7
