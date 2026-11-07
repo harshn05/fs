@@ -1,6 +1,6 @@
 # Folder Size Explorer
 
-[![Windows CI](https://github.com/harshn05/FolderSizeTool/actions/workflows/windows-ci.yml/badge.svg?branch=main)](https://github.com/harshn05/FolderSizeTool/actions/workflows/windows-ci.yml)
+[![Windows CI](https://github.com/harshn05/fs/actions/workflows/windows-ci.yml/badge.svg?branch=main)](https://github.com/harshn05/fs/actions/workflows/windows-ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A lightweight native Windows folder-size utility with two frontends: a graphical application and a command-line tool. Both use the same C++17 Win32 directory-scanning engine.
@@ -121,7 +121,7 @@ GitHub Actions builds both frontends independently with:
 
 The workflow uploads four temporary build artifacts: GUI and CLI for each compiler. Artifacts are retained for 7 days. CI verifies compilation; interactive filesystem behaviour should also be tested on Windows.
 
-See [GitHub Actions](https://github.com/harshn05/FolderSizeTool/actions).
+See [GitHub Actions](https://github.com/harshn05/fs/actions).
 
 ## License
 
