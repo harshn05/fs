@@ -11,7 +11,7 @@
  *                 recursive folder sizes.
  *
  *  License      : MIT License
- *  Repository   : https://github.com/harshn05/FolderSizeTool
+ *  Repository   : https://github.com/harshn05/fs
  * ============================================================================
  */
 
