@@ -20,6 +20,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <initguid.h>
 #include <filesystem>
 #include <string>
 #include <vector>
