@@ -80,10 +80,6 @@ Build-CLI.bat
 
 Output: `fs.exe`
 
-### Backward-compatible build command
-
-`Build.bat` remains available and builds the GUI application, as in earlier versions.
-
 Both build scripts detect `cl.exe` first and otherwise use `g++`. Run them from an x64 Visual Studio Developer Command Prompt or an environment with the MinGW-w64 compiler on `PATH`.
 
 ## Project structure
@@ -100,7 +96,6 @@ FolderSizeTool/
 │       └── fs.cpp
 ├── Build-GUI.bat
 ├── Build-CLI.bat
-├── Build.bat
 ├── LICENSE
 └── .github/workflows/windows-ci.yml
 ```
