@@ -20,7 +20,7 @@ if %errorlevel%==0 (
     g++ -std=c++17 -O2 -municode -mwindows ^
     -static -static-libgcc -static-libstdc++ ^
     FolderSizeTool.cpp -o FolderSizeTool.exe ^
-    -lcomctl32 -lshell32 -lole32 -lcomdlg32 -luser32
+    -lcomctl32 -lshell32 -lole32 -lcomdlg32 -luser32 -luuid
     if errorlevel 1 exit /b 1
 )
 echo.
