@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  *  Project      : Folder Size Explorer
- *  File         : FolderSizeTool.cpp
+ *  File         : FolderScanner.h
  *
  *  Copyright (c) 2026 Harsh Kumar Narula
  *  Author       : Harsh Kumar Narula
