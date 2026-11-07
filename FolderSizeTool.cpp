@@ -12,7 +12,7 @@
  *
  *  License      : MIT License
  *
- *  Repository   : https://github.com/harshn05
+ *  Repository   : https://github.com/harshn05/FolderSizeTool
  *
  * ============================================================================
  */
