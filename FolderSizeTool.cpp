@@ -1,3 +1,4 @@
+
 /*
  * ============================================================================
  *  Project      : Folder Size Explorer
@@ -6,6 +7,7 @@
  *  Copyright (c) 2026 Harsh Kumar Narula
  *  Author       : Harsh Kumar Narula
  *  Email        : harsh.narula@iitbombay.org
+ *
  *  Description  : A lightweight native Windows utility for analyzing
  *                 recursive folder sizes.
  *
@@ -20,24 +22,24 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shobjidl.h>
-#include <filesystem>
-#include <string>
-#include <vector>
+
 #include <algorithm>
-#include <thread>
 #include <atomic>
+#include <cstdint>
+#include <cstddef>
+#include <exception>
 #include <mutex>
 #include <sstream>
 #include <iomanip>
-#include <system_error>
+#include <string>
+#include <thread>
+#include <vector>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "user32.lib")
-
-namespace fs = std::filesystem;
 
 struct Item {
     std::wstring name;
@@ -69,11 +71,12 @@ static std::atomic<bool> gBusy{false};
 static std::atomic<bool> gCancelRequested{false};
 static std::atomic<bool> gShuttingDown{false};
 
-// The worker publishes results here. The UI thread takes ownership under lock.
+// Worker-to-UI result handoff. No heap pointer is passed in a window message.
 static std::mutex gResultMutex;
 static ScanResult gPendingResult;
 static bool gHasPendingResult = false;
 
+// Signalled by the worker after publishing its completed ScanResult.
 static HANDLE gScanCompletedEvent = nullptr;
 
 static constexpr UINT WM_SCAN_PROGRESS = WM_APP + 2;
@@ -97,10 +100,8 @@ static std::wstring FormatSize(unsigned long long n) {
     std::wostringstream stream;
     stream << std::fixed << std::setprecision(unit == 0 ? 0 : 2)
            << value << L" " << units[unit];
-
     return stream.str();
 }
-
 
 static std::wstring Commas(unsigned long long n) {
     std::wstring value = std::to_wstring(n);
@@ -111,7 +112,6 @@ static std::wstring Commas(unsigned long long n) {
     return value;
 }
 
-
 static void SetStatus(const std::wstring& value) {
     if (gStatus)
         SetWindowTextW(gStatus, value.c_str());
@@ -121,10 +121,6 @@ static void SetStatus(const std::wstring& value) {
 // ============================================================================
 // Path helpers
 // ============================================================================
-
-/*
- * Convert a normal absolute DOS/UNC path to Windows extended-length form.
- */
 
 static std::wstring ToExtendedPath(const std::wstring& path) {
     if (path.rfind(LR"(\\?\)", 0) == 0)
@@ -140,84 +136,232 @@ static std::wstring ToExtendedPath(const std::wstring& path) {
     return path;
 }
 
+static std::wstring JoinPath(
+    const std::wstring& directory,
+    const wchar_t* name)
+{
+    std::wstring result = directory;
+
+    if (!result.empty() && result.back() != L'\\' && result.back() != L'/')
+        result += L'\\';
+
+    result += name;
+    return result;
+}
+
+static std::wstring MakeSearchPattern(const std::wstring& directory) {
+    return JoinPath(directory, L"*");
+}
+
 
 // ============================================================================
-// Directory scanning
+// Native Win32 directory enumeration
 // ============================================================================
 
-static unsigned long long DirectorySize(
-    const fs::path& directory,
+/*
+ * FindFirstFileExW with FindExInfoBasic avoids requesting short-name data.
+ * LARGE_FETCH can improve enumeration on some filesystems. If the filesystem
+ * or OS rejects that flag, retry without it.
+ */
+static HANDLE FindDirectoryEntries(
+    const std::wstring& directory,
+    WIN32_FIND_DATAW& data)
+{
+    const std::wstring pattern = MakeSearchPattern(directory);
+
+    HANDLE handle = FindFirstFileExW(
+        pattern.c_str(),
+        FindExInfoBasic,
+        &data,
+        FindExSearchNameMatch,
+        nullptr,
+        FIND_FIRST_EX_LARGE_FETCH
+    );
+
+    if (handle == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+
+        if (error == ERROR_INVALID_PARAMETER || error == ERROR_NOT_SUPPORTED) {
+            handle = FindFirstFileExW(
+                pattern.c_str(),
+                FindExInfoBasic,
+                &data,
+                FindExSearchNameMatch,
+                nullptr,
+                0
+            );
+        }
+    }
+
+    return handle;
+}
+
+
+// RAII wrapper ensures FindClose runs even if an exception occurs.
+class FindHandleGuard {
+public:
+    explicit FindHandleGuard(HANDLE handle) noexcept : handle_(handle) {}
+
+    ~FindHandleGuard() {
+        if (handle_ != INVALID_HANDLE_VALUE)
+            FindClose(handle_);
+    }
+
+    FindHandleGuard(const FindHandleGuard&) = delete;
+    FindHandleGuard& operator=(const FindHandleGuard&) = delete;
+
+    HANDLE get() const noexcept {
+        return handle_;
+    }
+
+private:
+    HANDLE handle_;
+};
+
+
+static bool IsDotEntry(const wchar_t* name) {
+    return name[0] == L'.' &&
+        (name[1] == L'\0' || (name[1] == L'.' && name[2] == L'\0'));
+}
+
+static bool IsReparsePoint(const WIN32_FIND_DATAW& data) {
+    return (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+static bool IsDirectory(const WIN32_FIND_DATAW& data) {
+    return (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static bool IsNormalDirectory(const WIN32_FIND_DATAW& data) {
+    return IsDirectory(data) && !IsReparsePoint(data);
+}
+
+static bool IsEmptyDirectoryError(DWORD error) {
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_NO_MORE_FILES;
+}
+
+
+/*
+ * Recursively calculate a directory's logical file size using Win32
+ * enumeration metadata. Reparse points are deliberately skipped, so junctions
+ * and symbolic links are not traversed and their targets are not double-counted.
+ */
+static unsigned long long DirectorySizeNative(
+    const std::wstring& root,
     unsigned long long& files,
     unsigned long long& errors)
 {
     unsigned long long total = 0;
+    std::vector<std::wstring> pendingDirectories;
+    pendingDirectories.push_back(root);
 
-    std::error_code ec;
+    while (!pendingDirectories.empty() && !gCancelRequested.load()) {
+        std::wstring current = std::move(pendingDirectories.back());
+        pendingDirectories.pop_back();
 
-    fs::recursive_directory_iterator it(
-        directory,
-        fs::directory_options::skip_permission_denied,
-        ec
-    );
+        WIN32_FIND_DATAW data{};
+        HANDLE findHandle = FindDirectoryEntries(current, data);
 
-    const fs::recursive_directory_iterator end;
-
-    if (ec) {
-        ++errors;
-        ec.clear();
-    }
-
-    while (it != end && !gCancelRequested.load()) {
-
-        std::error_code statusError;
-
-        const bool isSymlink = it->is_symlink(statusError);
-
-        if (statusError) {
-            ++errors;
-        }
-        else if (isSymlink) {
-
-            std::error_code dirError;
-
-            if (it->is_directory(dirError) && !dirError)
-                it.disable_recursion_pending();
-
-            if (dirError)
+        if (findHandle == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            if (!IsEmptyDirectoryError(error))
                 ++errors;
+            continue;
         }
-        else {
 
-            std::error_code fileError;
+        FindHandleGuard findGuard(findHandle);
+        bool keepEnumerating = true;
 
-            if (it->is_regular_file(fileError)) {
+        while (keepEnumerating && !gCancelRequested.load()) {
+            if (!IsDotEntry(data.cFileName) && !IsReparsePoint(data)) {
+                if (IsDirectory(data)) {
+                    pendingDirectories.push_back(
+                        JoinPath(current, data.cFileName));
+                }
+                else {
+                    const unsigned long long size =
+                        (static_cast<unsigned long long>(data.nFileSizeHigh) << 32) |
+                        static_cast<unsigned long long>(data.nFileSizeLow);
 
-                std::error_code sizeError;
-
-                const auto size = it->file_size(sizeError);
-
-                if (!sizeError) {
                     total += size;
                     ++files;
                 }
-                else {
+            }
+
+            if (gCancelRequested.load())
+                break;
+
+            if (!FindNextFileW(findGuard.get(), &data)) {
+                const DWORD error = GetLastError();
+
+                if (error != ERROR_NO_MORE_FILES && !gCancelRequested.load())
                     ++errors;
-                }
-            }
-            else if (fileError) {
-                ++errors;
-            }
-        }
 
-        it.increment(ec);
-
-        if (ec) {
-            ++errors;
-            ec.clear();
+                keepEnumerating = false;
+            }
         }
     }
 
     return total;
+}
+
+
+/*
+ * Enumerate only the immediate child directories of the selected root.
+ * Each child is measured recursively by DirectorySizeNative().
+ */
+static ScanResult ScanRoot(const std::wstring& root) {
+    ScanResult result;
+
+    WIN32_FIND_DATAW data{};
+    HANDLE findHandle = FindDirectoryEntries(root, data);
+
+    if (findHandle == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (!IsEmptyDirectoryError(error))
+            ++result.rootErrors;
+        return result;
+    }
+
+    FindHandleGuard findGuard(findHandle);
+    bool keepEnumerating = true;
+
+    while (keepEnumerating && !gCancelRequested.load()) {
+        if (!IsDotEntry(data.cFileName) && IsNormalDirectory(data)) {
+            Item item;
+
+            item.name = data.cFileName;
+            item.path = JoinPath(root, data.cFileName);
+            item.bytes = DirectorySizeNative(
+                item.path, item.files, item.errors);
+
+            result.items.push_back(std::move(item));
+
+            // Progress is best-effort. Completion is signalled by an event.
+            if (!gShuttingDown.load()) {
+                PostMessageW(
+                    gMainWindow,
+                    WM_SCAN_PROGRESS,
+                    static_cast<WPARAM>(result.items.size()),
+                    0
+                );
+            }
+        }
+
+        if (gCancelRequested.load())
+            break;
+
+        if (!FindNextFileW(findGuard.get(), &data)) {
+            const DWORD error = GetLastError();
+
+            if (error != ERROR_NO_MORE_FILES && !gCancelRequested.load())
+                ++result.rootErrors;
+
+            keepEnumerating = false;
+        }
+    }
+
+    return result;
 }
 
 
@@ -226,15 +370,12 @@ static unsigned long long DirectorySize(
 // ============================================================================
 
 static void AddRow(const Item& item) {
-
     const int row = ListView_GetItemCount(gList);
 
     LVITEMW listItem{};
-
     listItem.mask = LVIF_TEXT;
     listItem.iItem = row;
     listItem.pszText = const_cast<wchar_t*>(item.name.c_str());
-
     ListView_InsertItem(gList, &listItem);
 
     std::wstring size = FormatSize(item.bytes);
@@ -248,7 +389,6 @@ static void AddRow(const Item& item) {
     ListView_SetItemText(gList, row, 4, errors.data());
 }
 
-
 static void RefreshRows() {
     ListView_DeleteAllItems(gList);
 
@@ -256,9 +396,7 @@ static void RefreshRows() {
         AddRow(item);
 }
 
-
 static void SortItems(int column) {
-
     static int sortColumn = 1;
     static bool sortAscending = false;
 
@@ -271,26 +409,19 @@ static void SortItems(int column) {
 
     std::sort(gItems.begin(), gItems.end(),
         [&](const Item& a, const Item& b) {
-
             int comparison = 0;
 
             if (column == 0) {
                 comparison = _wcsicmp(a.name.c_str(), b.name.c_str());
             }
             else if (column == 1 || column == 2) {
-                comparison =
-                    a.bytes < b.bytes ? -1 :
-                    a.bytes > b.bytes ? 1 : 0;
+                comparison = a.bytes < b.bytes ? -1 : a.bytes > b.bytes ? 1 : 0;
             }
             else if (column == 3) {
-                comparison =
-                    a.files < b.files ? -1 :
-                    a.files > b.files ? 1 : 0;
+                comparison = a.files < b.files ? -1 : a.files > b.files ? 1 : 0;
             }
             else {
-                comparison =
-                    a.errors < b.errors ? -1 :
-                    a.errors > b.errors ? 1 : 0;
+                comparison = a.errors < b.errors ? -1 : a.errors > b.errors ? 1 : 0;
             }
 
             return sortAscending ? comparison < 0 : comparison > 0;
@@ -305,7 +436,6 @@ static void SortItems(int column) {
 // ============================================================================
 
 static std::wstring PickFolder(HWND owner) {
-
     IFileOpenDialog* dialog = nullptr;
 
     HRESULT hr = CoCreateInstance(
@@ -319,13 +449,12 @@ static std::wstring PickFolder(HWND owner) {
         return {};
 
     DWORD options = 0;
-
     hr = dialog->GetOptions(&options);
 
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr)) {
         hr = dialog->SetOptions(
-            options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM
-        );
+            options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    }
 
     if (SUCCEEDED(hr))
         hr = dialog->Show(owner);
@@ -333,15 +462,11 @@ static std::wstring PickFolder(HWND owner) {
     std::wstring selectedPath;
 
     if (SUCCEEDED(hr)) {
-
         IShellItem* item = nullptr;
-
         hr = dialog->GetResult(&item);
 
         if (SUCCEEDED(hr) && item) {
-
             PWSTR path = nullptr;
-
             hr = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
 
             if (SUCCEEDED(hr) && path) {
@@ -354,31 +479,22 @@ static std::wstring PickFolder(HWND owner) {
     }
 
     dialog->Release();
-
     return selectedPath;
 }
 
 
 // ============================================================================
-// Scanning controls
+// Scanning controls and worker
 // ============================================================================
 
 static void SetScanningControls(bool scanning) {
-
     EnableWindow(gChoose, !scanning);
     EnableWindow(gScan, !scanning);
     EnableWindow(gCancel, scanning);
-
     EnableWindow(gExport, !scanning && !gItems.empty());
 }
 
-
-// ============================================================================
-// Scan worker
-// ============================================================================
-
 static void StartScan() {
-
     if (gBusy.load() || gRoot.empty() || gShuttingDown.load())
         return;
 
@@ -387,7 +503,6 @@ static void StartScan() {
 
     {
         std::lock_guard<std::mutex> lock(gResultMutex);
-
         gPendingResult = {};
         gHasPendingResult = false;
     }
@@ -396,137 +511,70 @@ static void StartScan() {
 
     gBusy = true;
     gCancelRequested = false;
-
     gItems.clear();
 
     ListView_DeleteAllItems(gList);
-
     SetScanningControls(true);
     SetStatus(L"Scanning folders...");
 
     const std::wstring root = ToExtendedPath(gRoot);
 
-    gWorker = std::thread([root]() {
+    try {
+        gWorker = std::thread([root]() {
+            ScanResult completed;
 
-        ScanResult completed;
+            try {
+                completed = ScanRoot(root);
+            }
+            catch (...) {
+                // Preserve application stability if an allocation or
+                // unexpected C++ exception occurs during enumeration.
+                ++completed.rootErrors;
+            }
 
-        std::error_code ec;
+            {
+                std::lock_guard<std::mutex> lock(gResultMutex);
+                gPendingResult = std::move(completed);
+                gHasPendingResult = true;
+            }
 
-        fs::directory_iterator it(
-            fs::path(root),
-            fs::directory_options::skip_permission_denied,
-            ec
+            // Event notification does not transfer ownership through a message.
+            SetEvent(gScanCompletedEvent);
+        });
+    }
+    catch (const std::exception&) {
+        gBusy = false;
+        SetScanningControls(false);
+        SetStatus(L"Could not start the scan worker thread.");
+
+        MessageBoxW(
+            gMainWindow,
+            L"Could not start the scan worker thread.",
+            L"Scan failed",
+            MB_ICONERROR
         );
-
-        const fs::directory_iterator end;
-
-        if (ec) {
-            ++completed.rootErrors;
-            ec.clear();
-        }
-
-        while (it != end && !gCancelRequested.load()) {
-
-            std::error_code entryError;
-
-            const bool isSymlink = it->is_symlink(entryError);
-
-            if (entryError) {
-                ++completed.rootErrors;
-            }
-            else if (!isSymlink && it->is_directory(entryError)) {
-
-                if (entryError) {
-                    ++completed.rootErrors;
-                }
-                else {
-
-                    Item item;
-
-                    item.name = it->path().filename().wstring();
-                    item.path = it->path().wstring();
-
-                    item.bytes = DirectorySize(
-                        it->path(),
-                        item.files,
-                        item.errors
-                    );
-
-                    completed.items.push_back(std::move(item));
-
-                    // Progress is best-effort.
-                    // Completion uses a Windows event.
-                    PostMessageW(
-                        gMainWindow,
-                        WM_SCAN_PROGRESS,
-                        static_cast<WPARAM>(completed.items.size()),
-                        0
-                    );
-                }
-            }
-            else if (entryError) {
-                ++completed.rootErrors;
-            }
-
-            it.increment(ec);
-
-            if (ec) {
-                ++completed.rootErrors;
-                ec.clear();
-            }
-        }
-
-        /*
-         * Publish the completed result.
-         *
-         * The worker never transfers a raw pointer to the UI thread.
-         */
-
-        {
-            std::lock_guard<std::mutex> lock(gResultMutex);
-
-            gPendingResult = std::move(completed);
-            gHasPendingResult = true;
-        }
-
-        /*
-         * Signal completion.
-         *
-         * This does not depend on PostMessage succeeding.
-         */
-
-        SetEvent(gScanCompletedEvent);
-    });
+    }
 }
 
 
 // ============================================================================
-// Completion handling
+// Scan completion
 // ============================================================================
 
-/*
- * Called only on the UI thread after gScanCompletedEvent is signalled.
- */
-
 static void CompleteScan() {
-
     if (gShuttingDown.load())
         return;
 
     ScanResult completed;
-
     bool hasResult = false;
 
     {
         std::lock_guard<std::mutex> lock(gResultMutex);
 
         if (gHasPendingResult) {
-
             completed = std::move(gPendingResult);
-
             gPendingResult = {};
             gHasPendingResult = false;
-
             hasResult = true;
         }
     }
@@ -534,16 +582,10 @@ static void CompleteScan() {
     if (!hasResult)
         return;
 
-    /*
-     * The worker signals the event only after publishing its result.
-     * Join before allowing another scan.
-     */
-
     if (gWorker.joinable())
         gWorker.join();
 
     gItems = std::move(completed.items);
-
     gBusy = false;
 
     std::sort(gItems.begin(), gItems.end(),
@@ -552,18 +594,15 @@ static void CompleteScan() {
         });
 
     RefreshRows();
-
     SetScanningControls(false);
 
     unsigned long long total = 0;
-
     for (const auto& item : gItems)
         total += item.bytes;
 
     std::wstring status =
         (gCancelRequested.load() ? L"Cancelled. " : L"Done. ") +
-        std::to_wstring(gItems.size()) +
-        L" folders | Total: " +
+        std::to_wstring(gItems.size()) + L" folders | Total: " +
         FormatSize(total);
 
     if (completed.rootErrors) {
@@ -572,7 +611,6 @@ static void CompleteScan() {
     }
 
     status += L" | Double-click a row to open it.";
-
     SetStatus(status);
 }
 
@@ -582,11 +620,9 @@ static void CompleteScan() {
 // ============================================================================
 
 static std::wstring CsvEscape(const std::wstring& value) {
-
     std::wstring escaped = L"\"";
 
     for (wchar_t ch : value) {
-
         if (ch == L'"')
             escaped += L"\"\"";
         else
@@ -594,26 +630,16 @@ static std::wstring CsvEscape(const std::wstring& value) {
     }
 
     escaped += L'"';
-
     return escaped;
 }
 
-
-static bool WriteAll(
-    HANDLE file,
-    const char* data,
-    size_t length)
-{
+static bool WriteAll(HANDLE file, const char* data, size_t length) {
     while (length > 0) {
-
         const DWORD chunk = static_cast<DWORD>(
-            (length > 1024 * 1024) ? 1024 * 1024 : length
-        );
-
+            (length > 1024 * 1024) ? 1024 * 1024 : length);
         DWORD written = 0;
 
-        if (!WriteFile(file, data, chunk, &written, nullptr) ||
-            written == 0)
+        if (!WriteFile(file, data, chunk, &written, nullptr) || written == 0)
             return false;
 
         data += written;
@@ -623,25 +649,19 @@ static bool WriteAll(
     return true;
 }
 
-
 static void ExportCsv(HWND owner) {
-
     if (gItems.empty())
         return;
 
     wchar_t file[MAX_PATH] = L"folder-sizes.csv";
 
     OPENFILENAMEW dialog{};
-
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = owner;
-
     dialog.lpstrFilter =
         L"CSV files (*.csv)\0*.csv\0All files (*.*)\0*.*\0";
-
     dialog.lpstrFile = file;
     dialog.nMaxFile = MAX_PATH;
-
     dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     dialog.lpstrDefExt = L"csv";
 
@@ -652,9 +672,7 @@ static void ExportCsv(HWND owner) {
         L"Folder,Size (bytes),Size (human),Files,Errors\r\n";
 
     for (const auto& item : gItems) {
-
-        wideData +=
-            CsvEscape(item.name) + L"," +
+        wideData += CsvEscape(item.name) + L"," +
             std::to_wstring(item.bytes) + L"," +
             CsvEscape(FormatSize(item.bytes)) + L"," +
             std::to_wstring(item.files) + L"," +
@@ -673,21 +691,12 @@ static void ExportCsv(HWND owner) {
     );
 
     if (requiredBytes <= 0) {
-
-        MessageBoxW(
-            owner,
-            L"Could not convert the report to UTF-8.",
-            L"Export failed",
-            MB_ICONERROR
-        );
-
+        MessageBoxW(owner, L"Could not convert the report to UTF-8.",
+            L"Export failed", MB_ICONERROR);
         return;
     }
 
-    std::string utf8(
-        static_cast<size_t>(requiredBytes),
-        '\0'
-    );
+    std::string utf8(static_cast<size_t>(requiredBytes), '\0');
 
     if (WideCharToMultiByte(
             CP_UTF8,
@@ -698,14 +707,8 @@ static void ExportCsv(HWND owner) {
             requiredBytes,
             nullptr,
             nullptr) != requiredBytes) {
-
-        MessageBoxW(
-            owner,
-            L"Could not convert the report to UTF-8.",
-            L"Export failed",
-            MB_ICONERROR
-        );
-
+        MessageBoxW(owner, L"Could not convert the report to UTF-8.",
+            L"Export failed", MB_ICONERROR);
         return;
     }
 
@@ -720,20 +723,12 @@ static void ExportCsv(HWND owner) {
     );
 
     if (output == INVALID_HANDLE_VALUE) {
-
-        MessageBoxW(
-            owner,
-            L"Could not create the CSV file.",
-            L"Export failed",
-            MB_ICONERROR
-        );
-
+        MessageBoxW(owner, L"Could not create the CSV file.",
+            L"Export failed", MB_ICONERROR);
         return;
     }
 
-    // UTF-8 BOM helps Excel recognize Unicode CSV files.
     static const char bom[] = "\xEF\xBB\xBF";
-
     const bool success =
         WriteAll(output, bom, sizeof(bom) - 1) &&
         WriteAll(output, utf8.data(), utf8.size());
@@ -741,7 +736,6 @@ static void ExportCsv(HWND owner) {
     const bool closeSuccess = CloseHandle(output) != FALSE;
 
     if (!success || !closeSuccess) {
-
         MessageBoxW(
             owner,
             L"An error occurred while writing the CSV file. "
@@ -749,7 +743,6 @@ static void ExportCsv(HWND owner) {
             L"Export failed",
             MB_ICONERROR
         );
-
         return;
     }
 
@@ -762,10 +755,7 @@ static void ExportCsv(HWND owner) {
 // ============================================================================
 
 static void OpenSelected() {
-
-    const int row = ListView_GetNextItem(
-        gList, -1, LVNI_SELECTED
-    );
+    const int row = ListView_GetNextItem(gList, -1, LVNI_SELECTED);
 
     if (row < 0 || row >= static_cast<int>(gItems.size()))
         return;
@@ -774,18 +764,10 @@ static void OpenSelected() {
 
     if (path.rfind(LR"(\\?\UNC\)", 0) == 0)
         path = LR"(\\)" + path.substr(8);
-
     else if (path.rfind(LR"(\\?\)", 0) == 0)
         path = path.substr(4);
 
-    ShellExecuteW(
-        nullptr,
-        L"open",
-        path.c_str(),
-        nullptr,
-        nullptr,
-        SW_SHOW
-    );
+    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOW);
 }
 
 
@@ -794,14 +776,11 @@ static void OpenSelected() {
 // ============================================================================
 
 static void CancelScanAndJoin() {
-
     if (!gWorker.joinable())
         return;
 
     gCancelRequested = true;
-
     gWorker.join();
-
     gBusy = false;
 }
 
@@ -817,286 +796,165 @@ static LRESULT CALLBACK WndProc(
     LPARAM lParam)
 {
     switch (message) {
-
     case WM_CREATE: {
-
         gChoose = CreateWindowW(
-            L"BUTTON",
-            L"Choose root folder...",
+            L"BUTTON", L"Choose root folder...",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            12, 12, 160, 30,
-            window,
-            (HMENU)101,
-            nullptr,
-            nullptr
-        );
+            12, 12, 160, 30, window, (HMENU)101, nullptr, nullptr);
 
         gScan = CreateWindowW(
-            L"BUTTON",
-            L"Scan",
+            L"BUTTON", L"Scan",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            180, 12, 80, 30,
-            window,
-            (HMENU)102,
-            nullptr,
-            nullptr
-        );
+            180, 12, 80, 30, window, (HMENU)102, nullptr, nullptr);
 
         gCancel = CreateWindowW(
-            L"BUTTON",
-            L"Cancel",
+            L"BUTTON", L"Cancel",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            268, 12, 80, 30,
-            window,
-            (HMENU)105,
-            nullptr,
-            nullptr
-        );
-
+            268, 12, 80, 30, window, (HMENU)105, nullptr, nullptr);
         EnableWindow(gCancel, FALSE);
 
         gExport = CreateWindowW(
-            L"BUTTON",
-            L"Export CSV",
+            L"BUTTON", L"Export CSV",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            356, 12, 100, 30,
-            window,
-            (HMENU)103,
-            nullptr,
-            nullptr
-        );
+            356, 12, 100, 30, window, (HMENU)103, nullptr, nullptr);
 
         gOpen = CreateWindowW(
-            L"BUTTON",
-            L"Open selected",
+            L"BUTTON", L"Open selected",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            464, 12, 115, 30,
-            window,
-            (HMENU)104,
-            nullptr,
-            nullptr
-        );
+            464, 12, 115, 30, window, (HMENU)104, nullptr, nullptr);
 
         gStatus = CreateWindowW(
-            L"STATIC",
-            L"Choose a root folder, then click Scan.",
+            L"STATIC", L"Choose a root folder, then click Scan.",
             WS_CHILD | WS_VISIBLE,
-            12, 50, 850, 22,
-            window,
-            nullptr,
-            nullptr,
-            nullptr
-        );
+            12, 50, 850, 22, window, nullptr, nullptr, nullptr);
 
         gList = CreateWindowW(
-            WC_LISTVIEWW,
-            L"",
-            WS_CHILD | WS_VISIBLE |
-            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-            12, 78, 850, 480,
-            window,
-            (HMENU)106,
-            GetModuleHandleW(nullptr),
-            nullptr
-        );
+            WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL |
+            LVS_SHOWSELALWAYS,
+            12, 78, 850, 480, window, (HMENU)106,
+            GetModuleHandleW(nullptr), nullptr);
 
         ListView_SetExtendedListViewStyle(
             gList,
-            LVS_EX_FULLROWSELECT |
-            LVS_EX_GRIDLINES |
-            LVS_EX_DOUBLEBUFFER
-        );
+            LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
 
         const wchar_t* headers[] = {
-            L"Folder",
-            L"Size",
-            L"Bytes",
-            L"Files",
-            L"Errors"
+            L"Folder", L"Size", L"Bytes", L"Files", L"Errors"
         };
-
-        const int widths[] = {
-            360, 120, 150, 100, 90
-        };
+        const int widths[] = {360, 120, 150, 100, 90};
 
         for (int i = 0; i < 5; ++i) {
-
             LVCOLUMNW column{};
-
             column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
             column.pszText = const_cast<wchar_t*>(headers[i]);
             column.cx = widths[i];
             column.iSubItem = i;
-
             ListView_InsertColumn(gList, i, &column);
         }
 
         return 0;
     }
 
-
     case WM_SIZE: {
-
         const int width = LOWORD(lParam);
         const int height = HIWORD(lParam);
 
-        MoveWindow(
-            gStatus,
-            12, 50,
-            width - 24, 22,
-            TRUE
-        );
+        MoveWindow(gStatus, 12, 50, width - 24, 22, TRUE);
+        MoveWindow(gList, 12, 78, width - 24, height - 90, TRUE);
 
-        MoveWindow(
-            gList,
-            12, 78,
-            width - 24, height - 90,
-            TRUE
-        );
-
-        const int widths[] = {
-            width - 520, 120, 150, 100, 90
-        };
-
+        const int widths[] = {width - 520, 120, 150, 100, 90};
         for (int i = 0; i < 5; ++i)
             ListView_SetColumnWidth(gList, i, widths[i]);
 
         return 0;
     }
 
-
     case WM_COMMAND:
-
         switch (LOWORD(wParam)) {
-
         case 101: {
-
             const std::wstring selected = PickFolder(window);
 
             if (!selected.empty()) {
-
                 gRoot = selected;
-
                 gItems.clear();
-
                 ListView_DeleteAllItems(gList);
-
                 SetStatus(L"Root: " + gRoot);
-
                 EnableWindow(gExport, FALSE);
             }
 
             return 0;
         }
-
-
         case 102:
             StartScan();
             return 0;
-
-
         case 103:
             ExportCsv(window);
             return 0;
-
-
         case 104:
             OpenSelected();
             return 0;
-
-
         case 105:
-
             if (gBusy.load()) {
-
                 SetStatus(L"Cancelling scan...");
-
                 gCancelRequested = true;
-
                 EnableWindow(gCancel, FALSE);
             }
-
             return 0;
         }
-
         break;
 
-
     case WM_NOTIFY: {
-
-        const auto* notification =
-            reinterpret_cast<NMHDR*>(lParam);
+        const auto* notification = reinterpret_cast<NMHDR*>(lParam);
 
         if (notification->hwndFrom == gList &&
             notification->code == LVN_COLUMNCLICK) {
-
-            const auto* column =
-                reinterpret_cast<NMLISTVIEW*>(lParam);
-
+            const auto* column = reinterpret_cast<NMLISTVIEW*>(lParam);
             SortItems(column->iSubItem);
         }
 
         if (notification->hwndFrom == gList &&
             notification->code == NM_DBLCLK) {
-
             OpenSelected();
         }
 
         break;
     }
 
-
     case WM_SCAN_PROGRESS:
-
-        SetStatus(
-            L"Scanning... " +
-            std::to_wstring(wParam) +
-            L" folders completed."
-        );
-
+        // Ignore queued progress updates after scan completion or shutdown.
+        if (!gShuttingDown.load() && gBusy.load()) {
+            SetStatus(L"Scanning... " + std::to_wstring(wParam) +
+                L" folders completed.");
+        }
         return 0;
 
-
     case WM_CLOSE:
-
         gShuttingDown = true;
 
         if (gBusy.load()) {
-
             SetStatus(L"Stopping scan before exit...");
-
             CancelScanAndJoin();
         }
 
         DestroyWindow(window);
-
         return 0;
 
-
     case WM_DESTROY:
-
         gShuttingDown = true;
-
         CancelScanAndJoin();
 
         {
             std::lock_guard<std::mutex> lock(gResultMutex);
-
             gPendingResult = {};
             gHasPendingResult = false;
         }
 
         PostQuitMessage(0);
-
         return 0;
     }
 
-    return DefWindowProcW(
-        window,
-        message,
-        wParam,
-        lParam
-    );
+    return DefWindowProcW(window, message, wParam, lParam);
 }
 
 
@@ -1111,103 +969,58 @@ int WINAPI wWinMain(
     int showCommand)
 {
     const HRESULT comResult = CoInitializeEx(
-        nullptr,
-        COINIT_APARTMENTTHREADED
-    );
+        nullptr, COINIT_APARTMENTTHREADED);
 
-    /*
-     * Manual-reset event used by the worker to notify the UI thread
-     * that a scan has completed.
-     */
-
-    gScanCompletedEvent = CreateEventW(
-        nullptr,
-        TRUE,
-        FALSE,
-        nullptr
-    );
+    gScanCompletedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
     if (!gScanCompletedEvent) {
-
         if (SUCCEEDED(comResult))
             CoUninitialize();
-
         return 1;
     }
 
-
     INITCOMMONCONTROLSEX controls{
-        sizeof(controls),
-        ICC_LISTVIEW_CLASSES
+        sizeof(controls), ICC_LISTVIEW_CLASSES
     };
-
     InitCommonControlsEx(&controls);
 
-
     WNDCLASSW windowClass{};
-
     windowClass.lpfnWndProc = WndProc;
     windowClass.hInstance = instance;
     windowClass.lpszClassName = L"FolderSizeToolWindow";
-
     windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
-
     windowClass.hbrBackground =
         reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
 
-
     if (!RegisterClassW(&windowClass)) {
-
         CloseHandle(gScanCompletedEvent);
-
         if (SUCCEEDED(comResult))
             CoUninitialize();
-
         return 1;
     }
-
 
     gMainWindow = CreateWindowW(
         windowClass.lpszClassName,
         L"Folder Size Explorer",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        900,
-        620,
-        nullptr,
-        nullptr,
-        instance,
-        nullptr
-    );
-
+        CW_USEDEFAULT, CW_USEDEFAULT, 900, 620,
+        nullptr, nullptr, instance, nullptr);
 
     if (!gMainWindow) {
-
         CloseHandle(gScanCompletedEvent);
-
         if (SUCCEEDED(comResult))
             CoUninitialize();
-
         return 1;
     }
-
 
     ShowWindow(gMainWindow, showCommand);
     UpdateWindow(gMainWindow);
 
-
-    /*
-     * Wait for either:
-     *   1. Scan completion event
-     *   2. Ordinary Windows messages
-     */
-
+    // Wait for scan completion or ordinary Windows messages.
     int exitCode = 0;
     bool running = true;
 
     while (running) {
-
         const DWORD waitResult = MsgWaitForMultipleObjects(
             1,
             &gScanCompletedEvent,
@@ -1216,31 +1029,17 @@ int WINAPI wWinMain(
             QS_ALLINPUT
         );
 
-
         if (waitResult == WAIT_OBJECT_0) {
-
             ResetEvent(gScanCompletedEvent);
-
             CompleteScan();
         }
-
         else if (waitResult == WAIT_OBJECT_0 + 1) {
-
             MSG message{};
 
-            while (PeekMessageW(
-                &message,
-                nullptr,
-                0,
-                0,
-                PM_REMOVE))
-            {
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
                 if (message.message == WM_QUIT) {
-
                     exitCode = static_cast<int>(message.wParam);
-
                     running = false;
-
                     break;
                 }
 
@@ -1248,30 +1047,27 @@ int WINAPI wWinMain(
                 DispatchMessageW(&message);
             }
         }
-
         else {
-
             exitCode = 1;
-
             running = false;
         }
     }
 
-
-    /*
-     * Defensive cleanup in case shutdown began during an active scan.
-     */
-
+    // Defensive cleanup before releasing the completion event.
     gShuttingDown = true;
-
     CancelScanAndJoin();
 
-    if (gScanCompletedEvent)
-        CloseHandle(gScanCompletedEvent);
+    {
+        std::lock_guard<std::mutex> lock(gResultMutex);
+        gPendingResult = {};
+        gHasPendingResult = false;
+    }
+
+    CloseHandle(gScanCompletedEvent);
+    gScanCompletedEvent = nullptr;
 
     if (SUCCEEDED(comResult))
         CoUninitialize();
-
 
     return exitCode;
 }
