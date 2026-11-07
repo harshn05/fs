@@ -9,7 +9,7 @@ A lightweight native Windows folder-size utility with two frontends: a graphical
 
 ### Folder Size Explorer (GUI)
 
-`FolderSizeTool.exe` lets you select a root directory, recursively calculate the logical size of each immediate child folder, sort the results, open a selected folder, and export a UTF-8 CSV report.
+`fs-gui.exe` lets you select a root directory, recursively calculate the logical size of each immediate child folder, sort the results, open a selected folder, and export a UTF-8 CSV report.
 
 Features:
 
@@ -70,7 +70,7 @@ The project supports 64-bit MSVC and MinGW-w64 (MSYS2 UCRT64).
 Build-GUI.bat
 ```
 
-Output: `FolderSizeTool.exe`
+Output: `fs-gui.exe`
 
 ### Build the CLI
 
