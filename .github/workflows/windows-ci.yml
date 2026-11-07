@@ -1,4 +1,3 @@
-
 name: Windows CI
 
 on:
@@ -10,11 +9,6 @@ permissions:
   contents: read
 
 jobs:
-
-  # ---------------------------------------------------------
-  # MSVC Build
-  # ---------------------------------------------------------
-
   msvc:
     name: MSVC x64 Build
     runs-on: windows-latest
@@ -28,23 +22,36 @@ jobs:
         with:
           arch: amd64
 
-      - name: Build with MSVC
+      - name: Build GUI application
         shell: cmd
-        run: |
-          cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE FolderSizeTool.cpp /link /SUBSYSTEM:WINDOWS comctl32.lib shell32.lib ole32.lib comdlg32.lib user32.lib /OUT:FolderSizeTool.exe
+        run: >-
+          cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE
+          src\gui\FolderSizeTool.cpp src\common\FolderScanner.cpp
+          /link /SUBSYSTEM:WINDOWS comctl32.lib shell32.lib ole32.lib
+          comdlg32.lib user32.lib /OUT:FolderSizeTool.exe
 
-      - name: Upload MSVC executable
+      - name: Build CLI application
+        shell: cmd
+        run: >-
+          cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE
+          src\cli\fs.cpp src\common\FolderScanner.cpp
+          /link /SUBSYSTEM:CONSOLE /OUT:fs.exe
+
+      - name: Upload GUI executable
         uses: actions/upload-artifact@v7
         with:
-          name: FolderSizeTool-MSVC-x64
+          name: FolderSizeTool-GUI-MSVC-x64
           path: FolderSizeTool.exe
           if-no-files-found: error
           retention-days: 7
 
-
-  # ---------------------------------------------------------
-  # MinGW-w64 Build
-  # ---------------------------------------------------------
+      - name: Upload CLI executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: FolderSizeTool-CLI-MSVC-x64
+          path: fs.exe
+          if-no-files-found: error
+          retention-days: 7
 
   mingw:
     name: MinGW-w64 UCRT64 Build
@@ -66,20 +73,35 @@ jobs:
           install: mingw-w64-ucrt-x86_64-gcc
 
       - name: Show compiler version
-        run: |
-          g++ --version
+        run: g++ --version
 
-      - name: Build with MinGW-w64
-        run: |
-          g++ -std=c++17 -O2 -municode -mwindows \
-            -static -static-libgcc -static-libstdc++ \
-            FolderSizeTool.cpp -o FolderSizeTool.exe \
-            -lcomctl32 -lshell32 -lole32 -lcomdlg32 -luser32 -luuid
+      - name: Build GUI application
+        run: >-
+          g++ -std=c++17 -O2 -municode -mwindows
+          -static -static-libgcc -static-libstdc++
+          src/gui/FolderSizeTool.cpp src/common/FolderScanner.cpp
+          -o FolderSizeTool.exe
+          -lcomctl32 -lshell32 -lole32 -lcomdlg32 -luser32 -luuid
 
-      - name: Upload MinGW executable
+      - name: Build CLI application
+        run: >-
+          g++ -std=c++17 -O2 -municode -mconsole
+          -static -static-libgcc -static-libstdc++
+          src/cli/fs.cpp src/common/FolderScanner.cpp
+          -o fs.exe
+
+      - name: Upload GUI executable
         uses: actions/upload-artifact@v7
         with:
-          name: FolderSizeTool-MinGW-UCRT64
+          name: FolderSizeTool-GUI-MinGW-UCRT64
           path: FolderSizeTool.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload CLI executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: FolderSizeTool-CLI-MinGW-UCRT64
+          path: fs.exe
           if-no-files-found: error
           retention-days: 7

@@ -1,4 +1,3 @@
-
 /*
  * ============================================================================
  *  Project      : Folder Size Explorer
@@ -33,7 +32,10 @@
 #include <iomanip>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#include "../common/FolderScanner.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -41,18 +43,8 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "user32.lib")
 
-struct Item {
-    std::wstring name;
-    std::wstring path;
-    unsigned long long bytes = 0;
-    unsigned long long files = 0;
-    unsigned long long errors = 0;
-};
-
-struct ScanResult {
-    std::vector<Item> items;
-    unsigned long long rootErrors = 0;
-};
+using Item = folder_scanner::FolderInfo;
+using ScanResult = folder_scanner::ScanResult;
 
 static HWND gMainWindow = nullptr;
 static HWND gList = nullptr;
@@ -80,7 +72,6 @@ static bool gHasPendingResult = false;
 static HANDLE gScanCompletedEvent = nullptr;
 
 static constexpr UINT WM_SCAN_PROGRESS = WM_APP + 2;
-
 
 // ============================================================================
 // Formatting helpers
@@ -117,253 +108,7 @@ static void SetStatus(const std::wstring& value) {
         SetWindowTextW(gStatus, value.c_str());
 }
 
-
-// ============================================================================
-// Path helpers
-// ============================================================================
-
-static std::wstring ToExtendedPath(const std::wstring& path) {
-    if (path.rfind(LR"(\\?\)", 0) == 0)
-        return path;
-
-    if (path.rfind(LR"(\\)", 0) == 0)
-        return LR"(\\?\UNC\)" + path.substr(2);
-
-    if (path.size() >= 3 && path[1] == L':' &&
-        (path[2] == L'\\' || path[2] == L'/'))
-        return LR"(\\?\)" + path;
-
-    return path;
-}
-
-static std::wstring JoinPath(
-    const std::wstring& directory,
-    const wchar_t* name)
-{
-    std::wstring result = directory;
-
-    if (!result.empty() && result.back() != L'\\' && result.back() != L'/')
-        result += L'\\';
-
-    result += name;
-    return result;
-}
-
-static std::wstring MakeSearchPattern(const std::wstring& directory) {
-    return JoinPath(directory, L"*");
-}
-
-
-// ============================================================================
-// Native Win32 directory enumeration
-// ============================================================================
-
-/*
- * FindFirstFileExW with FindExInfoBasic avoids requesting short-name data.
- * LARGE_FETCH can improve enumeration on some filesystems. If the filesystem
- * or OS rejects that flag, retry without it.
- */
-static HANDLE FindDirectoryEntries(
-    const std::wstring& directory,
-    WIN32_FIND_DATAW& data)
-{
-    const std::wstring pattern = MakeSearchPattern(directory);
-
-    HANDLE handle = FindFirstFileExW(
-        pattern.c_str(),
-        FindExInfoBasic,
-        &data,
-        FindExSearchNameMatch,
-        nullptr,
-        FIND_FIRST_EX_LARGE_FETCH
-    );
-
-    if (handle == INVALID_HANDLE_VALUE) {
-        const DWORD error = GetLastError();
-
-        if (error == ERROR_INVALID_PARAMETER || error == ERROR_NOT_SUPPORTED) {
-            handle = FindFirstFileExW(
-                pattern.c_str(),
-                FindExInfoBasic,
-                &data,
-                FindExSearchNameMatch,
-                nullptr,
-                0
-            );
-        }
-    }
-
-    return handle;
-}
-
-
-// RAII wrapper ensures FindClose runs even if an exception occurs.
-class FindHandleGuard {
-public:
-    explicit FindHandleGuard(HANDLE handle) noexcept : handle_(handle) {}
-
-    ~FindHandleGuard() {
-        if (handle_ != INVALID_HANDLE_VALUE)
-            FindClose(handle_);
-    }
-
-    FindHandleGuard(const FindHandleGuard&) = delete;
-    FindHandleGuard& operator=(const FindHandleGuard&) = delete;
-
-    HANDLE get() const noexcept {
-        return handle_;
-    }
-
-private:
-    HANDLE handle_;
-};
-
-
-static bool IsDotEntry(const wchar_t* name) {
-    return name[0] == L'.' &&
-        (name[1] == L'\0' || (name[1] == L'.' && name[2] == L'\0'));
-}
-
-static bool IsReparsePoint(const WIN32_FIND_DATAW& data) {
-    return (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-}
-
-static bool IsDirectory(const WIN32_FIND_DATAW& data) {
-    return (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-}
-
-static bool IsNormalDirectory(const WIN32_FIND_DATAW& data) {
-    return IsDirectory(data) && !IsReparsePoint(data);
-}
-
-static bool IsEmptyDirectoryError(DWORD error) {
-    return error == ERROR_FILE_NOT_FOUND || error == ERROR_NO_MORE_FILES;
-}
-
-
-/*
- * Recursively calculate a directory's logical file size using Win32
- * enumeration metadata. Reparse points are deliberately skipped, so junctions
- * and symbolic links are not traversed and their targets are not double-counted.
- */
-static unsigned long long DirectorySizeNative(
-    const std::wstring& root,
-    unsigned long long& files,
-    unsigned long long& errors)
-{
-    unsigned long long total = 0;
-    std::vector<std::wstring> pendingDirectories;
-    pendingDirectories.push_back(root);
-
-    while (!pendingDirectories.empty() && !gCancelRequested.load()) {
-        std::wstring current = std::move(pendingDirectories.back());
-        pendingDirectories.pop_back();
-
-        WIN32_FIND_DATAW data{};
-        HANDLE findHandle = FindDirectoryEntries(current, data);
-
-        if (findHandle == INVALID_HANDLE_VALUE) {
-            const DWORD error = GetLastError();
-            if (!IsEmptyDirectoryError(error))
-                ++errors;
-            continue;
-        }
-
-        FindHandleGuard findGuard(findHandle);
-        bool keepEnumerating = true;
-
-        while (keepEnumerating && !gCancelRequested.load()) {
-            if (!IsDotEntry(data.cFileName) && !IsReparsePoint(data)) {
-                if (IsDirectory(data)) {
-                    pendingDirectories.push_back(
-                        JoinPath(current, data.cFileName));
-                }
-                else {
-                    const unsigned long long size =
-                        (static_cast<unsigned long long>(data.nFileSizeHigh) << 32) |
-                        static_cast<unsigned long long>(data.nFileSizeLow);
-
-                    total += size;
-                    ++files;
-                }
-            }
-
-            if (gCancelRequested.load())
-                break;
-
-            if (!FindNextFileW(findGuard.get(), &data)) {
-                const DWORD error = GetLastError();
-
-                if (error != ERROR_NO_MORE_FILES && !gCancelRequested.load())
-                    ++errors;
-
-                keepEnumerating = false;
-            }
-        }
-    }
-
-    return total;
-}
-
-
-/*
- * Enumerate only the immediate child directories of the selected root.
- * Each child is measured recursively by DirectorySizeNative().
- */
-static ScanResult ScanRoot(const std::wstring& root) {
-    ScanResult result;
-
-    WIN32_FIND_DATAW data{};
-    HANDLE findHandle = FindDirectoryEntries(root, data);
-
-    if (findHandle == INVALID_HANDLE_VALUE) {
-        const DWORD error = GetLastError();
-        if (!IsEmptyDirectoryError(error))
-            ++result.rootErrors;
-        return result;
-    }
-
-    FindHandleGuard findGuard(findHandle);
-    bool keepEnumerating = true;
-
-    while (keepEnumerating && !gCancelRequested.load()) {
-        if (!IsDotEntry(data.cFileName) && IsNormalDirectory(data)) {
-            Item item;
-
-            item.name = data.cFileName;
-            item.path = JoinPath(root, data.cFileName);
-            item.bytes = DirectorySizeNative(
-                item.path, item.files, item.errors);
-
-            result.items.push_back(std::move(item));
-
-            // Progress is best-effort. Completion is signalled by an event.
-            if (!gShuttingDown.load()) {
-                PostMessageW(
-                    gMainWindow,
-                    WM_SCAN_PROGRESS,
-                    static_cast<WPARAM>(result.items.size()),
-                    0
-                );
-            }
-        }
-
-        if (gCancelRequested.load())
-            break;
-
-        if (!FindNextFileW(findGuard.get(), &data)) {
-            const DWORD error = GetLastError();
-
-            if (error != ERROR_NO_MORE_FILES && !gCancelRequested.load())
-                ++result.rootErrors;
-
-            keepEnumerating = false;
-        }
-    }
-
-    return result;
-}
-
+// Folder enumeration is implemented by the shared scanner in src/common.
 
 // ============================================================================
 // ListView helpers
@@ -430,7 +175,6 @@ static void SortItems(int column) {
     RefreshRows();
 }
 
-
 // ============================================================================
 // Folder picker
 // ============================================================================
@@ -482,7 +226,6 @@ static std::wstring PickFolder(HWND owner) {
     return selectedPath;
 }
 
-
 // ============================================================================
 // Scanning controls and worker
 // ============================================================================
@@ -517,18 +260,31 @@ static void StartScan() {
     SetScanningControls(true);
     SetStatus(L"Scanning folders...");
 
-    const std::wstring root = ToExtendedPath(gRoot);
+    const std::wstring root = gRoot;
 
     try {
         gWorker = std::thread([root]() {
             ScanResult completed;
 
             try {
-                completed = ScanRoot(root);
+                completed = folder_scanner::ScanRoot(
+                    root,
+                    gCancelRequested,
+                    [](size_t completedFolders, const std::wstring&) {
+                        // Progress is best-effort. Completion is signalled by an event.
+                        if (!gShuttingDown.load()) {
+                            PostMessageW(
+                                gMainWindow,
+                                WM_SCAN_PROGRESS,
+                                static_cast<WPARAM>(completedFolders),
+                                0
+                            );
+                        }
+                    });
             }
             catch (...) {
-                // Preserve application stability if an allocation or
-                // unexpected C++ exception occurs during enumeration.
+                // Preserve already collected results if an allocation or
+                // unexpected C++ exception occurs during the scan.
                 ++completed.rootErrors;
             }
 
@@ -538,7 +294,7 @@ static void StartScan() {
                 gHasPendingResult = true;
             }
 
-            // Event notification does not transfer ownership through a message.
+            // Event notification cannot lose ownership of the result.
             SetEvent(gScanCompletedEvent);
         });
     }
@@ -546,7 +302,6 @@ static void StartScan() {
         gBusy = false;
         SetScanningControls(false);
         SetStatus(L"Could not start the scan worker thread.");
-
         MessageBoxW(
             gMainWindow,
             L"Could not start the scan worker thread.",
@@ -555,7 +310,6 @@ static void StartScan() {
         );
     }
 }
-
 
 // ============================================================================
 // Scan completion
@@ -613,7 +367,6 @@ static void CompleteScan() {
     status += L" | Double-click a row to open it.";
     SetStatus(status);
 }
-
 
 // ============================================================================
 // CSV export
@@ -749,7 +502,6 @@ static void ExportCsv(HWND owner) {
     SetStatus(L"Exported: " + std::wstring(file));
 }
 
-
 // ============================================================================
 // Open selected folder
 // ============================================================================
@@ -770,7 +522,6 @@ static void OpenSelected() {
     ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOW);
 }
 
-
 // ============================================================================
 // Shutdown
 // ============================================================================
@@ -783,7 +534,6 @@ static void CancelScanAndJoin() {
     gWorker.join();
     gBusy = false;
 }
-
 
 // ============================================================================
 // Window procedure
@@ -956,7 +706,6 @@ static LRESULT CALLBACK WndProc(
 
     return DefWindowProcW(window, message, wParam, lParam);
 }
-
 
 // ============================================================================
 // Application entry point

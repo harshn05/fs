@@ -3,87 +3,131 @@
 [![Windows CI](https://github.com/harshn05/FolderSizeTool/actions/workflows/windows-ci.yml/badge.svg?branch=main)](https://github.com/harshn05/FolderSizeTool/actions/workflows/windows-ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A lightweight, native Windows utility that shows how much space each immediate subfolder consumes. Select a root directory, scan its child folders recursively, sort the results, and export a CSV report.
+A lightweight native Windows folder-size utility with two frontends: a graphical application and a command-line tool. Both use the same C++17 Win32 directory-scanning engine.
 
-## Features
+## Applications
 
-- **Recursive folder sizing:** Calculates the total logical file size of each immediate child directory.
-- **Fast native enumeration:** Uses `FindFirstFileExW` and `FindNextFileW`, reading file sizes directly from directory enumeration metadata.
-- **Sortable results:** Sort by folder name, size, byte count, file count, or scan errors.
-- **Open folders:** Double-click a result or select it and choose **Open selected**.
-- **CSV export:** Exports folder names and scan statistics as UTF-8 CSV with a BOM for spreadsheet compatibility.
-- **Cancellation:** Stop an active scan and start another scan without restarting the application.
-- **Long-path scanning:** Uses extended-length Windows paths for filesystem enumeration.
-- **No third-party C++ dependencies:** Built directly on the Win32 API and the C++ standard library.
+### Folder Size Explorer (GUI)
+
+`FolderSizeTool.exe` lets you select a root directory, recursively calculate the logical size of each immediate child folder, sort the results, open a selected folder, and export a UTF-8 CSV report.
+
+Features:
+
+- Native Win32 directory enumeration using `FindFirstFileExW` and `FindNextFileW`.
+- Folder size, exact byte count, file count, and detected enumeration errors.
+- Sortable result columns.
+- Open selected folders or double-click a result.
+- UTF-8 CSV export with a BOM for spreadsheet compatibility.
+- Cancel an active scan and start another scan without restarting the application.
+- Unicode names and extended-length path scanning.
+
+### Folder Size Explorer CLI (`fs.exe`)
+
+`fs.exe` prints the immediate child folders of the current working directory, sorted from largest to smallest, with their recursive size, exact bytes, file count, and errors.
+
+Run it from the directory you want to inspect:
+
+```bat
+fs
+```
+
+Or provide a folder path:
+
+```bat
+fs "D:\Development"
+```
+
+Show usage:
+
+```bat
+fs --help
+```
+
+Place `fs.exe` in a directory on `PATH` to invoke it from any working directory. Otherwise, run it by its full path.
+
+The CLI writes the report to standard output and scan progress/errors to standard error. Redirect the report to a UTF-8 text file like this:
+
+```bat
+fs "D:\Data" > folder-sizes.txt
+```
+
+Press **Ctrl+C** to cancel a scan. Cancelled output is marked as partial.
+
+Exit codes:
+
+- `0`: scan completed without detected errors.
+- `1`: invalid arguments, inaccessible root, or startup failure.
+- `2`: scan completed with one or more detected enumeration errors.
+- `130`: scan cancelled with Ctrl+C.
 
 ## Build
 
-The project supports 64-bit MSVC and MinGW-w64.
+The project supports 64-bit MSVC and MinGW-w64 (MSYS2 UCRT64).
 
-### Option 1: Build.bat
-
-Run `Build.bat` from either:
-
-- **MSVC:** an x64 Visual Studio Developer Command Prompt with the C++ build tools and Windows SDK available.
-- **MinGW-w64:** an x64 MinGW-w64 environment with `g++` available. The supplied command is configured for MSYS2 UCRT64.
-
-The script detects `cl.exe` first and otherwise uses `g++`. The executable is written beside the source as `FolderSizeTool.exe`.
-
-### Option 2: Build manually
-
-**MSVC (x64):**
+### Build the GUI
 
 ```bat
-cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE FolderSizeTool.cpp /link /SUBSYSTEM:WINDOWS comctl32.lib shell32.lib ole32.lib comdlg32.lib user32.lib /OUT:FolderSizeTool.exe
+Build-GUI.bat
 ```
 
-**MinGW-w64 (MSYS2 UCRT64):**
+Output: `FolderSizeTool.exe`
 
-```bash
-g++ -std=c++17 -O2 -municode -mwindows \
-  -static -static-libgcc -static-libstdc++ \
-  FolderSizeTool.cpp -o FolderSizeTool.exe \
-  -lcomctl32 -lshell32 -lole32 -lcomdlg32 -luser32 -luuid
+### Build the CLI
+
+```bat
+Build-CLI.bat
 ```
 
-The MinGW command statically links the GCC and C++ runtime libraries. Windows system libraries remain operating-system dependencies.
+Output: `fs.exe`
 
-## Usage
+### Backward-compatible build command
 
-1. Launch `FolderSizeTool.exe`.
-2. Select **Choose root folder...** and choose a directory.
-3. Select **Scan**.
-4. Click a column header to sort the results.
-5. Double-click a folder to open it, or use **Open selected**.
-6. Select **Export CSV** to save the report.
+`Build.bat` remains available and builds the GUI application, as in earlier versions.
 
-The **Size** and **Bytes** columns show the total logical size of files found under each immediate child folder. **Files** is the number of files counted. **Errors** reports enumeration or metadata errors encountered while scanning that child folder.
+Both build scripts detect `cl.exe` first and otherwise use `g++`. Run them from an x64 Visual Studio Developer Command Prompt or an environment with the MinGW-w64 compiler on `PATH`.
+
+## Project structure
+
+```text
+FolderSizeTool/
+├── src/
+│   ├── common/
+│   │   ├── FolderScanner.h
+│   │   └── FolderScanner.cpp
+│   ├── gui/
+│   │   └── FolderSizeTool.cpp
+│   └── cli/
+│       └── fs.cpp
+├── Build-GUI.bat
+├── Build-CLI.bat
+├── Build.bat
+├── LICENSE
+└── .github/workflows/windows-ci.yml
+```
+
+The GUI and CLI share `FolderScanner`. Filesystem traversal, file-size accounting, reparse-point handling, long-path conversion, and scan-error counting are implemented once in the common library.
 
 ## Scan behaviour and limitations
 
-- The scan is read-only. It does not create, modify, or delete the scanned files.
-- The tool reports **logical file sizes**, not allocated disk space on storage devices. Sparse files and filesystem compression can therefore make allocated space different from the reported size.
-- The selected root's own files are not listed separately; the report contains its immediate child directories.
-- Reparse-point entries are skipped. This avoids following directory symlinks and junctions, but also means file reparse points are not counted.
-- Inaccessible directories and files are skipped where possible. Check the **Errors** column for scan errors that were detected; some access-denied entries may be skipped by Windows enumeration.
-- Extended-length paths are used for scanning. Opening an extremely long path through the Windows shell may still be limited by shell/application path handling.
-- Scan duration depends on the number of entries, storage device, filesystem, and access permissions.
+- The scanner reports **logical file sizes**, not allocated disk space. Sparse files and filesystem compression can therefore make allocated space different from the reported size.
+- The selected root's own files are not listed separately. Only its immediate child directories are returned, with their contents measured recursively.
+- Reparse-point entries are skipped. This prevents traversing directory symlinks and junctions, and also means file reparse points are not counted.
+- Inaccessible entries are skipped where possible and detected enumeration failures are counted. Some inaccessible entries may be skipped by Windows enumeration without a separately reported entry-level error.
+- Extended-length paths are used for filesystem enumeration. Opening extremely long paths through the Windows shell may still be limited by shell/application path handling.
+- Scan duration depends on the number of entries, filesystem, storage device, and access permissions.
+- The tool is read-only. It does not create, modify, or delete scanned files.
 
 ## Continuous integration
 
-GitHub Actions builds the project independently with:
+GitHub Actions builds both frontends independently with:
 
 - MSVC x64
 - MinGW-w64 UCRT64
 
-Each successful workflow run uploads the corresponding executable as a downloadable artifact. These CI jobs verify compilation; interactive scanning behaviour should also be tested on Windows.
+The workflow uploads four temporary build artifacts: GUI and CLI for each compiler. Artifacts are retained for 7 days. CI verifies compilation; interactive filesystem behaviour should also be tested on Windows.
 
 See [GitHub Actions](https://github.com/harshn05/FolderSizeTool/actions).
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
-
----
-
-Repository: [github.com/harshn05/FolderSizeTool](https://github.com/harshn05/FolderSizeTool)
+MIT License. Copyright (c) 2026 Harsh Kumar Narula.
