@@ -1,3 +1,20 @@
+/*
+ * ============================================================================
+ *  Project      : Folder Size Explorer
+ *  File         : FolderSizeTool.cpp
+ *
+ *  Copyright (c) 2026 Harsh Kumar Narula
+ *  Author       : Harsh Kumar Narula
+ *  Email        : harsh.narula@iitbombay.org
+ *
+ *  Description  : A lightweight native Windows utility for analyzing
+ *                 recursive folder sizes.
+ *
+ *  License      : MIT License
+ *  Repository   : https://github.com/harshn05/fs
+ * ============================================================================
+ */
+
 #include "FolderScanner.h"
 
 #define WIN32_LEAN_AND_MEAN
