@@ -28,7 +28,7 @@ jobs:
           cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE
           src\gui\FolderSizeTool.cpp src\common\FolderScanner.cpp
           /link /SUBSYSTEM:WINDOWS comctl32.lib shell32.lib ole32.lib
-          comdlg32.lib user32.lib /OUT:FolderSizeTool.exe
+          comdlg32.lib user32.lib /OUT:fs-gui.exe
 
       - name: Build CLI application
         shell: cmd
@@ -40,15 +40,15 @@ jobs:
       - name: Upload GUI executable
         uses: actions/upload-artifact@v7
         with:
-          name: FolderSizeTool-GUI-MSVC-x64
-          path: FolderSizeTool.exe
+          name: fs-gui-MSVC-x64
+          path: fs-gui.exe
           if-no-files-found: error
           retention-days: 7
 
       - name: Upload CLI executable
         uses: actions/upload-artifact@v7
         with:
-          name: FolderSizeTool-CLI-MSVC-x64
+          name: fs-MSVC-x64
           path: fs.exe
           if-no-files-found: error
           retention-days: 7
@@ -80,7 +80,7 @@ jobs:
           g++ -std=c++17 -O2 -municode -mwindows
           -static -static-libgcc -static-libstdc++
           src/gui/FolderSizeTool.cpp src/common/FolderScanner.cpp
-          -o FolderSizeTool.exe
+          -o fs-gui.exe
           -lcomctl32 -lshell32 -lole32 -lcomdlg32 -luser32 -luuid
 
       - name: Build CLI application
@@ -93,15 +93,15 @@ jobs:
       - name: Upload GUI executable
         uses: actions/upload-artifact@v7
         with:
-          name: FolderSizeTool-GUI-MinGW-UCRT64
-          path: FolderSizeTool.exe
+          name: fs-gui-MinGW-UCRT64
+          path: fs-gui.exe
           if-no-files-found: error
           retention-days: 7
 
       - name: Upload CLI executable
         uses: actions/upload-artifact@v7
         with:
-          name: FolderSizeTool-CLI-MinGW-UCRT64
+          name: fs-MinGW-UCRT64
           path: fs.exe
           if-no-files-found: error
           retention-days: 7
