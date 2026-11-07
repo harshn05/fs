@@ -85,7 +85,7 @@ Both build scripts detect `cl.exe` first and otherwise use `g++`. Run them from 
 ## Project structure
 
 ```text
-FolderSizeTool/
+fs/
 ├── src/
 │   ├── common/
 │   │   ├── FolderScanner.h
